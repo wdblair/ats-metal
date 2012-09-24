@@ -1,8 +1,32 @@
 #include <stdint.h>
 #include "multiboot.h"
 
-static unsigned char *videoram = (unsigned char*)0xB8000;
+// Defines the structures of a GDT entry and of a GDT pointer
+struct gdt_entry
+{
+	unsigned short limit_low;
+	unsigned short base_low;
+	unsigned char base_middle;
+	unsigned char access;
+	unsigned char granularity;
+	unsigned char base_high;
+} __attribute__((packed));
+ 
+struct gdt_ptr
+{
+	unsigned short limit;
+	unsigned int base;
+} __attribute__((packed));
+ 
 
+// We declare a pointer to the VGA array and its attributes
+unsigned short *video = (unsigned short *)0xC00B8000; // We could also use the virtual address 0xC00B8000
+unsigned char attrib = 0xF; // White text on black background
+
+static unsigned int xpos, ypos;
+
+#define LINES 25
+#define COLUMNS 80
 
 /* Convert the integer D to a string and save the string in BUF. If
    BASE is equal to 'd', interpret that D is decimal, and if BASE is
@@ -50,14 +74,6 @@ itoa (char *buf, int base, int d)
     }
 }
 
-#define bit_is_set(num, bit) (num & (1 << bit))
-
-static unsigned int xpos, ypos;
-
-#define LINES 25
-#define COLUMNS 80
-#define ATTRIBUTE 0x2a
-
 /* Put the character C on the screen. */
 static void
 putchar (int c)
@@ -72,8 +88,7 @@ putchar (int c)
       return;
     }
      
-  *(videoram + (xpos + ypos * COLUMNS) * 2) = c & 0xFF;
-  *(videoram + (xpos + ypos * COLUMNS) * 2 + 1) = ATTRIBUTE;
+  *(video + (xpos + ypos * COLUMNS)) = (attrib << 8) | c & 0xFF;
 
   xpos++;
   if (xpos >= COLUMNS)
@@ -87,60 +102,126 @@ void puts(char *s) {
   return;
 }
 
-void kmain(void)
-{
-  extern uint32_t magic;
-  extern multiboot_info_t *mbd;
-  int i;
-  char buffer[32];
+// We'll need at least 3 entries in our GDT...
  
-  if ( magic !=  MULTIBOOT_BOOTLOADER_MAGIC )
-    {
-      /* Something went not according to specs. Print an error */
-      /* message and halt, but do *not* rely on the multiboot */
-      /* data structure. */
-      puts("error\n");
-      return;
-    }
+struct gdt_entry gdt[3];
+struct gdt_ptr gp;
+ 
+// Extern assembler function
+void gdt_flush();
+ 
+// Very simple: fills a GDT entry using the parameters
+void gdt_set_gate(int num, unsigned long base, unsigned long limit, 
+                  unsigned char access, unsigned char gran)
+{
+  gdt[num].base_low = (base & 0xFFFF);
+  gdt[num].base_middle = (base >> 16) & 0xFF;
+  gdt[num].base_high = (base >> 24) & 0xFF;
   
-  /* You could either use multiboot.h */
-  /* (http://www.gnu.org/software/grub/manual/multiboot/multiboot.html#multiboot_002eh) */
-  /* or do your offsets yourself. The following is merely an example. */ 
-  //char * boot_loader_name =(char*) ((long*)mbd)[16];
-  multiboot_memory_map_t* mmap = (multiboot_memory_map_t*)mbd->mmap_addr;
+  gdt[num].limit_low = (limit & 0xFFFF);
+  gdt[num].granularity = ((limit >> 16) & 0x0F);
   
-  //clear the screen
-  for(i = 1; i < 4000; i += 2) {
-    videoram[i] = 0;
+  gdt[num].granularity |= (gran & 0xF0);
+  gdt[num].access = access;
+}
+
+// Sets our 3 gates and installs the real GDT through the assembler function
+void gdt_install()
+{
+  gp.limit = (sizeof(struct gdt_entry) * 3) - 1;
+  gp.base = (unsigned int)&gdt;
+  
+  gdt_set_gate(0, 0, 0, 0, 0);
+  gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF);
+  gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
+  
+  gdt_flush();
+}
+
+// Declare the page directory and a page table, both 4kb-aligned
+unsigned long kernelpagedir[1024] __attribute__ ((aligned (4096)));
+unsigned long lowpagetable[1024] __attribute__ ((aligned (4096)));
+ 
+// This function fills the page directory and the page table,
+// then enables paging by putting the address of the page directory
+// into the CR3 register and setting the 31st bit into the CR0 one
+void init_paging()
+{
+	// Pointers to the page directory and the page table
+	void *kernelpagedirPtr = 0;
+	void *lowpagetablePtr = 0;
+	int k = 0;
+ 
+	kernelpagedirPtr = (char *)kernelpagedir + 0x40000000;	// Translate the page directory from
+								// virtual address to physical address
+	lowpagetablePtr = (char *)lowpagetable + 0x40000000;	// Same for the page table
+        
+	// Counts from 0 to 1023 to...
+	for (k = 0; k < 1024; k++)
+	{
+          lowpagetable[k] = (k * 4096) | 0x3;	// ...map the first 4MB of memory into the page table...
+          kernelpagedir[k] = 0;			// ...and clear the page directory entries
+	}
+ 
+	// Fills the addresses 0...4MB and 3072MB...3076MB of the page directory
+	// with the same page table
+ 
+	kernelpagedir[0] = (unsigned long)lowpagetablePtr | 0x3;
+	kernelpagedir[768] = (unsigned long)lowpagetablePtr | 0x3;
+        
+	// Copies the address of the page directory into the CR3 register and, finally, enables paging!
+ 
+	asm volatile (	"mov %0, %%eax\n"
+			"mov %%eax, %%cr3\n"
+			"mov %%cr0, %%eax\n"
+			"orl $0x80000000, %%eax\n"
+			"mov %%eax, %%cr0\n" :: "m" (kernelpagedirPtr));
+}
+ 
+// Extern functions
+void gdt_install();
+void init_paging();
+ 
+// Clears the screen
+void cls()
+{
+	int i = 0;
+ 
+	for (i = 0; i < 80 * 25; i++)
+		video[i] = (attrib << 8) | 0;
+}
+ 
+// Prints the welcome message ;)
+void helloworld()
+{
+	char msg[] = "Hello, World!";
+	int i = 0;
+ 
+	for (i = 0; msg[i] != '\0'; i++)
+          video[i] = (attrib << 8) | msg[i];
+}
+ 
+// Our kernel's first function: kmain
+void kmain()
+{
+  extern multiboot_uint32_t magic;
+  char buf[20];
+
+   // FIRST enable paging and THEN load the real GDT!
+  init_paging();
+  gdt_install();
+  
+  cls();
+  itoa(buf, 'x', magic);
+  puts(buf);
+  puts("\n");
+  puts("What\n");
+ 
+  if( magic != (0x2BADB002)) {
+    puts("Error");
+    return;
   }
-  
-  if (bit_is_set(mbd->flags, 6)) {
-    
-    while(mmap < mbd->mmap_addr + mbd->mmap_length) {
-      mmap = (multiboot_memory_map_t*) ( (unsigned int)mmap + mmap->size + sizeof(unsigned int));
-      
-      if(mmap->type == MULTIBOOT_MEMORY_AVAILABLE) {
-        puts("Memory Available!\n");
-      } else
-        continue;
-      
-      //Is ignoring the higher 32 bytes a problem??
-      //      itoa(buffer, 'x', mmap->addr >> 32);
-      //      puts(buffer);
-      itoa(buffer, 'x', mmap->addr);
-      puts(buffer);
-      putchar(' ');
-      //      itoa(buffer, 'x', mmap->len >> 32);
-      //      puts(buffer);
-      //The length of memory available.
-      itoa(buffer, 'x', mmap->len);
-      puts(buffer);
-      putchar(' ');
-      itoa(buffer, 'd', mmap->type);
-      puts(buffer);
-      putchar('\n');
-    }
-  }
-  puts("Geschaft!");
-  videoram[1] = 0x2a; /* light grey (7) on black (0). */
+ 
+  // Hang up the computer
+  for (;;);
 }

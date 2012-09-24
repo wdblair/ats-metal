@@ -1,29 +1,30 @@
-ENTRY (loader)
+ENTRY (start)
 
 SECTIONS
 {
-    . = 0x00100000;
+	. = 0x100000;
 
-    .text ALIGN (0x1000) :
-    {
-        *(.text)
-    }
+	.setup :
+	{
+		*(.setup)
+	}
 
-    .rodata ALIGN (0x1000) :
-    {
-        *(.rodata*)
-    }
+	. += 0xC0000000;
 
-    .data ALIGN (0x1000) :
-    {
-        *(.data)
-    }
+	.text : AT(ADDR(.text) - 0xC0000000)
+	{
+		*(.text)
+	}
 
-    .bss :
-    {
-        sbss = .;
-        *(COMMON)
-        *(.bss)
-        ebss = .;
-    }
+	.data ALIGN (4096) : AT(ADDR(.data) - 0xC0000000)
+	{
+		*(.data)
+		*(.rodata*)
+	}
+
+	.bss ALIGN (4096) : AT(ADDR(.bss) - 0xC0000000)
+	{
+		*(COMMON*)
+		*(.bss*)
+	}
 }
